@@ -86,12 +86,14 @@ class TeleTurboGUI:
         self._dialogs_data: list = []
         self._video_cache: dict[int, list] = {}
         self._download_items_by_group: dict[str, list] = {}
+        self._item_index: dict[str, DownloadItem] = {}
         self._authorized = False
         self._update_throttle: dict[int, float] = {}
         self._sidebar_buttons: list = []
         self._content_frames: list = []
         self._active_section = 0
         self._dl_item_ids: set[str] = set()
+        self._all_done_flag: bool = False
 
         self.is_dark = getattr(self.config, 'dark_mode', True)
         C.clear()
@@ -264,15 +266,6 @@ class TeleTurboGUI:
     # ----------------------------------------------------------------
     # Cards helper
     # ----------------------------------------------------------------
-    def _card(self, parent, **kw):
-        f = tk.Frame(parent, bg=C["card_bd"] if "bd" in kw else C["card_bg"],
-                     highlightbackground=C["input_border"],
-                     highlightthickness=1, highlightcolor=C["input_border"])
-        if "pad" in kw:
-            padding = int(kw["pad"])
-            f.pack(fill=kw.get("fill", tk.X), padx=padding, pady=padding)
-        return f
-
     # ================================================================
     # LOGIN SECTION
     # ================================================================
@@ -388,8 +381,14 @@ class TeleTurboGUI:
                          highlightthickness=1)
         card3.pack(fill=tk.BOTH, expand=True, padx=24, pady=(8, 24))
 
-        tk.Label(card3, text="Log", font=("Segoe UI", 11, "bold"),
-                 bg=C["card_bg"], fg=C["text_primary"]).pack(anchor=tk.W, padx=18, pady=(10, 4))
+        log_header = tk.Frame(card3, bg=C["card_bg"])
+        log_header.pack(fill=tk.X, padx=18, pady=(10, 4))
+        tk.Label(log_header, text="Log", font=("Segoe UI", 11, "bold"),
+                 bg=C["card_bg"], fg=C["text_primary"]).pack(side=tk.LEFT)
+        tk.Button(log_header, text="Clear", font=("Segoe UI", 9),
+                  bg=C["content_bg"], fg=C["text_primary"], bd=0, padx=10, pady=2,
+                  activebackground=C["border"], cursor="hand2",
+                  command=self._on_clear_log).pack(side=tk.RIGHT)
 
         self.log_text = tk.Text(card3, height=8, state=tk.DISABLED, wrap=tk.WORD,
                                  bg=C["content_bg"], fg=C["text_secondary"],
@@ -447,6 +446,26 @@ class TeleTurboGUI:
                                     activeforeground="#ffffff", cursor="hand2",
                                     command=self._on_fetch_videos, state=tk.DISABLED)
         self.btn_fetch.pack(side=tk.LEFT, padx=8)
+        self.btn_fetch_files = tk.Button(r2, text="\uD83D\uDCC1 Fetch Files", font=("Segoe UI", 10),
+                                          bg=C["accent"], fg="#ffffff", bd=0, padx=18, pady=4,
+                                          activebackground=C["accent_hover"],
+                                          activeforeground="#ffffff", cursor="hand2",
+                                          command=self._on_fetch_files, state=tk.DISABLED)
+        self.btn_fetch_files.pack(side=tk.LEFT, padx=(8, 0))
+
+        # Select all / deselect all (right-aligned)
+        btn_select_all = tk.Button(r2, text="Select All", font=("Segoe UI", 9),
+                                    bg=C["content_bg"], fg=C["text_primary"],
+                                    bd=0, padx=10, pady=3, cursor="hand2",
+                                    activebackground=C["border"],
+                                    command=self._select_all_dialogs)
+        btn_select_all.pack(side=tk.RIGHT, padx=(8, 0))
+        btn_deselect_all = tk.Button(r2, text="Deselect All", font=("Segoe UI", 9),
+                                      bg=C["content_bg"], fg=C["text_primary"],
+                                      bd=0, padx=10, pady=3, cursor="hand2",
+                                      activebackground=C["border"],
+                                      command=self._deselect_all_dialogs)
+        btn_deselect_all.pack(side=tk.RIGHT, padx=(8, 0))
 
         # Dialogs tree card
         card = tk.Frame(p, bg=C["card_bg"], highlightbackground=C["border"],
@@ -649,10 +668,12 @@ class TeleTurboGUI:
                                   activebackground=C["sidebar_hover"],
                                   activeforeground=C["sidebar_fg"])
         self.dl_context.add_command(label="\u25B6 Start", command=self._ctx_start)
-        self.dl_context.add_command(label="\u23F8 Pause", command=self._ctx_pause)
+        self.dl_context.add_command(label="\u2716 Cancel", command=self._ctx_pause)
         self.dl_context.add_separator()
         self.dl_context.add_command(label="\u2716 Remove", command=self._on_remove_selected)
         self.dl_context.add_command(label="\uD83D\uDCC2 Open Folder", command=self._ctx_open_folder)
+        self.dl_context.add_separator()
+        self.dl_context.add_command(label="\u21BB Retry Selected", command=self._ctx_retry)
         self.dl_tree.bind("<Button-3>", self._on_dl_context)
 
         # ---- Preview card (right) ----
@@ -724,6 +745,14 @@ class TeleTurboGUI:
                   bg=C["content_bg"], fg=C["text_primary"], bd=0, padx=12, pady=3,
                   activebackground=C["border"], cursor="hand2",
                   command=self._on_clear_completed).pack(side=tk.LEFT)
+        tk.Button(bot_inner, text="Select All", font=("Segoe UI", 9),
+                  bg=C["content_bg"], fg=C["text_primary"], bd=0, padx=12, pady=3,
+                  activebackground=C["border"], cursor="hand2",
+                  command=self._select_all_downloads).pack(side=tk.LEFT, padx=(6, 0))
+        tk.Button(bot_inner, text="Deselect All", font=("Segoe UI", 9),
+                  bg=C["content_bg"], fg=C["text_primary"], bd=0, padx=12, pady=3,
+                  activebackground=C["border"], cursor="hand2",
+                  command=self._deselect_all_downloads).pack(side=tk.LEFT, padx=(6, 0))
 
         self.dl_status_var = tk.StringVar(value="0 items")
         tk.Label(bot_inner, textvariable=self.dl_status_var,
@@ -764,6 +793,11 @@ class TeleTurboGUI:
         self.log_text.see(tk.END)
         self.log_text.configure(state=tk.DISABLED)
 
+    def _on_clear_log(self):
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.delete("1.0", tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+
     def run(self):
         self.root.mainloop()
 
@@ -793,7 +827,6 @@ class TeleTurboGUI:
         phone = self.config.phone.strip()
         if not phone or not self.config.api_id or not self.config.api_hash:
             return
-        from pathlib import Path
         session_file = Path(f"sessions/session_{phone}.session")
         if not session_file.exists():
             return
@@ -825,7 +858,6 @@ class TeleTurboGUI:
         if await self.client.is_authorized():
             return True
         await self.client.disconnect()
-        self.client = None
         return False
 
     # ----------------------------------------------------------------
@@ -1016,7 +1048,6 @@ class TeleTurboGUI:
         self._clear_dialog_tree()
         self._dialogs_data = []
         # Clear cached sessions
-        from pathlib import Path
         for f in Path("sessions").glob(f"session_{phone}.session*"):
             try:
                 f.unlink()
@@ -1060,9 +1091,47 @@ class TeleTurboGUI:
         self.dialog_tree.item(item, values=values)
         self._update_fetch_button()
 
+    def _select_all_downloads(self):
+        for cid in self.dl_tree.get_children():
+            vals = list(self.dl_tree.item(cid, "values"))
+            vals[0] = CHECKED
+            self.dl_tree.item(cid, values=vals)
+        if self._selected_dl_item:
+            self._update_preview_sel_btn()
+        self._update_dl_status()
+
+    def _deselect_all_downloads(self):
+        for cid in self.dl_tree.get_children():
+            vals = list(self.dl_tree.item(cid, "values"))
+            vals[0] = UNCHECKED
+            self.dl_tree.item(cid, values=vals)
+        if self._selected_dl_item:
+            self._update_preview_sel_btn()
+        self._update_dl_status()
+
     def _update_fetch_button(self):
         has_checked = any(d.get("_checked") for d in self._dialogs_data)
         self.btn_fetch.configure(state=tk.NORMAL if has_checked else tk.DISABLED)
+        self.btn_fetch_files.configure(state=tk.NORMAL if has_checked else tk.DISABLED)
+
+    def _select_all_dialogs(self):
+        for d in self._dialogs_data:
+            d["_checked"] = True
+        # Reflect in tree
+        for item in self.dialog_tree.get_children():
+            vals = list(self.dialog_tree.item(item, "values"))
+            vals[0] = CHECKED
+            self.dialog_tree.item(item, values=vals)
+        self._update_fetch_button()
+
+    def _deselect_all_dialogs(self):
+        for d in self._dialogs_data:
+            d["_checked"] = False
+        for item in self.dialog_tree.get_children():
+            vals = list(self.dialog_tree.item(item, "values"))
+            vals[0] = UNCHECKED
+            self.dialog_tree.item(item, values=vals)
+        self._update_fetch_button()
 
     def _on_refresh_dialogs(self):
         if not self.client:
@@ -1087,6 +1156,16 @@ class TeleTurboGUI:
         self._async_cb(self.client.get_dialogs(), cb)
 
     def _on_fetch_videos(self):
+        self._on_fetch_media("video")
+
+    def _on_fetch_files(self):
+        self._on_fetch_media("file")
+
+    def _on_fetch_media(self, mode: str):
+        """Scan selected groups for media.
+
+        mode: "video" (videos only) or "file" (non-video documents)
+        """
         checked = [d for d in self._dialogs_data if d.get("_checked")]
         if not checked:
             messagebox.showwarning("Warning", "Select at least one group/channel first")
@@ -1095,11 +1174,24 @@ class TeleTurboGUI:
             limit = int(self.limit_var.get().strip())
         except ValueError:
             limit = 200
-        self._log(f"Scanning {len(checked)} groups for videos (limit={limit})...")
-        self.btn_fetch.configure(state=tk.DISABLED)
+        label = "videos" if mode == "video" else "files"
+        scan_method = (self.client.get_video_messages if mode == "video"
+                       else self.client.get_file_messages)
+        filename_fn = (self.client.get_video_filename if mode == "video"
+                       else self.client.get_file_filename)
+        btn = (self.btn_fetch if mode == "video" else self.btn_fetch_files)
+        self._log(f"Scanning {len(checked)} groups for {label} (limit={limit})...")
+        btn.configure(state=tk.DISABLED)
         self.scan_status_var.set("Scanning...")
         self._video_cache.clear()
+        # Clear existing scan results to keep tree in sync with data model
+        for cid in list(self._dl_item_ids):
+            if self.dl_tree.exists(cid):
+                self.dl_tree.delete(cid)
+        self._dl_item_ids.clear()
         self._download_items_by_group.clear()
+        self._update_dl_status()
+        self._clear_preview()
 
         async def _scan_all():
             total = []
@@ -1107,14 +1199,19 @@ class TeleTurboGUI:
                 self.root.after(0, lambda: self.scan_status_var.set(
                     f"Scanning {i+1}/{len(checked)}: {d['title']}"))
                 try:
-                    msgs = await self.client.get_video_messages(d["entity"], limit=limit)
+                    msgs = await scan_method(d["entity"], limit=limit)
                 except Exception as e:
-                    self.root.after(0, lambda e=e, t=d["title"]: self._log(f"Error scanning {t}: {e}"))
+                    self.root.after(0, lambda e=e, t=d["title"]:
+                                    self._log(f"Error scanning {t}: {e}"))
                     continue
                 items = []
                 for msg in msgs:
-                    fname = self.client.get_video_filename(msg)
-                    fsize = msg.video.size if msg.video else 0
+                    fname = filename_fn(msg)
+                    if mode == "video":
+                        fsize = (msg.document.size if msg.document
+                                 else (msg.video.size if msg.video else 0))
+                    else:
+                        fsize = msg.document.size if msg.document else 0
                     dur = self.client.get_video_duration(msg)
                     item = DownloadItem(
                         chat_title=d["title"],
@@ -1127,21 +1224,23 @@ class TeleTurboGUI:
                     items.append(item)
                 if items:
                     self._download_items_by_group[d["title"]] = items
+                    for it in items:
+                        self._item_index[str(id(it))] = it
                     total.extend(items)
                 self.root.after(0, lambda t=d["title"], n=len(items): self._log(
-                    f"  {t}: {n} videos found"))
+                    f"  {t}: {n} {label} found"))
             return total
 
         def cb(result, error):
-            self.btn_fetch.configure(state=tk.NORMAL)
+            btn.configure(state=tk.NORMAL)
             self.scan_status_var.set("Ready")
             if error:
                 self._log(f"Scan failed: {error}")
                 return
             if not result:
-                self._log("No videos found.")
+                self._log(f"No {label} found.")
                 return
-            self._log(f"Total: {len(result)} videos queued.")
+            self._log(f"Total: {len(result)} {label} queued.")
             self._add_items_to_download_tab(result)
             self._show_section(2)
 
@@ -1151,11 +1250,7 @@ class TeleTurboGUI:
     # Downloads handlers
     # ----------------------------------------------------------------
     def _find_dl_item(self, cid: str):
-        for item_list in self._download_items_by_group.values():
-            for it in item_list:
-                if str(id(it)) == cid:
-                    return it
-        return None
+        return self._item_index.get(cid)
 
     def _clear_preview(self):
         self._selected_dl_item = None
@@ -1213,9 +1308,11 @@ class TeleTurboGUI:
         cache_dir = Path("cache/thumbnails")
         cache_dir.mkdir(parents=True, exist_ok=True)
         msg_id = item.message.id
-        thumb_path = cache_dir / f"{msg_id}.jpg"
-        chat_id = getattr(item.message.chat_id if hasattr(item.message, 'chat_id') else item.message.peer_id, 'channel_id', msg_id)
-        safe_path = cache_dir / f"{chat_id}_{msg_id}.jpg"
+        chat_id = getattr(
+            item.message.chat_id if hasattr(item.message, 'chat_id') else item.message.peer_id,
+            'channel_id', msg_id)
+        cache_key = f"{chat_id}_{msg_id}"
+        safe_path = cache_dir / f"{cache_key}.jpg"
         if not safe_path.exists():
             try:
                 result = await self.client.download_thumbnail(item.message, str(safe_path))
@@ -1233,7 +1330,11 @@ class TeleTurboGUI:
             new_w, new_h = int(w * ratio), int(h * ratio)
             img = img.resize((new_w, new_h), Image.LANCZOS)
             photo = ImageTk.PhotoImage(img)
-            self._thumb_cache[msg_id] = photo
+            self._thumb_cache[cache_key] = photo
+            # LRU cap: 50 entries
+            if len(self._thumb_cache) > 50:
+                oldest = next(iter(self._thumb_cache))
+                del self._thumb_cache[oldest]
             self.root.after(0, lambda: self.thumb_label.configure(
                 image=photo, text=""))
         except Exception:
@@ -1259,6 +1360,9 @@ class TeleTurboGUI:
             self.download_dir_var.set(d)
 
     def _on_fetch_link(self):
+        if not self.client or not self._authorized:
+            messagebox.showwarning("Warning", "Login first")
+            return
         link = self.link_var.get().strip()
         if not link:
             messagebox.showwarning("Warning", "Paste a Telegram video link first")
@@ -1276,7 +1380,8 @@ class TeleTurboGUI:
             self.link_status.configure(text="Not a video", fg=C["warning"])
             return
         fname = self.client.get_video_filename(msg)
-        fsize = msg.video.size if msg.video else 0
+        fsize = (msg.document.size if msg.document
+                 else (msg.video.size if msg.video else 0))
         dur = self.client.get_video_duration(msg)
         item = DownloadItem(
             chat_title=self.link_var.get().strip()[:40],
@@ -1288,6 +1393,7 @@ class TeleTurboGUI:
         )
         key = f"link_{len(self._download_items_by_group)}"
         self._download_items_by_group[key] = [item]
+        self._item_index[str(id(item))] = item
         self._add_items_to_download_tab([item])
         self.link_status.configure(text=f"Added: {fname}", fg=C["success"])
         self.link_var.set("")
@@ -1314,16 +1420,27 @@ class TeleTurboGUI:
             return
         self._show_preview(item)
 
+    def _ensure_queue(self):
+        """Create a new DownloadQueue if none exists or current is inactive."""
+        if self.download_queue and self.download_queue.is_active:
+            return
+        self.download_queue = DownloadQueue(
+            self.client,
+            max_concurrent=int(self.concurrent_var.get().strip() or 3),
+        )
+        self.download_queue.set_on_update(self._on_dl_update)
+        self.btn_pause.configure(state=tk.NORMAL, text="\u23F8 Pause")
+        self.btn_cancel_all.configure(state=tk.NORMAL)
+
     def _on_start_all(self):
         if not self.client or not self._authorized:
             messagebox.showwarning("Warning", "Login first")
             return
-        children = self.dl_tree.get_children()
-        if not children:
+        if not self.dl_tree.get_children():
             messagebox.showwarning("Warning", "No items. Fetch videos first.")
             return
         items = []
-        for cid in children:
+        for cid in self.dl_tree.get_children():
             vals = self.dl_tree.item(cid, "values")
             if vals[0] != CHECKED:
                 continue
@@ -1335,17 +1452,10 @@ class TeleTurboGUI:
         if not items:
             messagebox.showinfo("Info", "No checked/queued items to download")
             return
-        self.download_queue = DownloadQueue(
-            self.client,
-            max_concurrent=int(self.concurrent_var.get().strip() or 3),
-        )
-        self.download_queue.set_on_update(self._on_dl_update)
+        self._ensure_queue()
         self.download_queue.add_items(items)
-        self._log(f"Starting download of {len(items)} checked items...")
-        self.btn_start.configure(state=tk.DISABLED)
-        self.btn_pause.configure(state=tk.NORMAL, text="\u23F8 Pause")
-        self.btn_cancel_all.configure(state=tk.NORMAL)
-        self._run_async(self.download_queue.process())
+        self._log(f"Added {len(items)} item(s) to download queue")
+        self._run_async(self.download_queue.start())
 
     def _on_pause(self):
         if not self.download_queue:
@@ -1368,6 +1478,8 @@ class TeleTurboGUI:
         for cid in selected:
             self.dl_tree.delete(cid)
             self._dl_item_ids.discard(cid)
+            self._item_index.pop(cid, None)
+            self._update_throttle.pop(int(cid), None)
             for item_list in self._download_items_by_group.values():
                 item_list[:] = [it for it in item_list if str(id(it)) != cid]
         if not self.dl_tree.get_children():
@@ -1381,6 +1493,8 @@ class TeleTurboGUI:
             if vals[5] in ("Completed", "Skipped (exists)", "Cancelled"):
                 self.dl_tree.delete(cid)
                 self._dl_item_ids.discard(cid)
+                self._item_index.pop(cid, None)
+                self._update_throttle.pop(int(cid), None)
                 for item_list in self._download_items_by_group.values():
                     item_list[:] = [it for it in item_list if str(id(it)) != cid]
         if not self.dl_tree.get_children():
@@ -1431,7 +1545,7 @@ class TeleTurboGUI:
                 self.root.after(500, self._on_all_done)
 
     def _on_all_done(self):
-        if getattr(self, "_all_done_flag", False):
+        if self._all_done_flag:
             return
         self._all_done_flag = True
         self.btn_start.configure(state=tk.NORMAL)
@@ -1456,18 +1570,29 @@ class TeleTurboGUI:
         total_pct = 0.0
         for cid in all_children:
             vals = self.dl_tree.item(cid, "values")
+            item = self._find_dl_item(cid)
             counts["all"] += 1
             if vals[0] == CHECKED:
                 checked += 1
-            s = vals[5]
-            if s.endswith("%") or s == "Downloading":
+            # Read status from item directly, not from display string
+            if item is not None and item.status == DownloadStatus.DOWNLOADING:
                 counts["downloading"] += 1
-                total_pct += float(s.rstrip("%")) if s.endswith("%") else 0
-            elif s in ("Completed", "Skipped (exists)"):
+                total_pct += item.progress
+            elif item is not None and item.status in (DownloadStatus.COMPLETED, DownloadStatus.SKIPPED):
                 counts["completed"] += 1
                 total_pct += 100
-            elif s in ("Failed", "Cancelled"):
+            elif item is not None and item.status in (DownloadStatus.FAILED, DownloadStatus.CANCELLED):
                 counts["failed"] += 1
+            else:
+                # Fallback for stale display strings
+                s = vals[5]
+                if s.endswith("%") or s == "Downloading":
+                    counts["downloading"] += 1
+                elif s in ("Completed", "Skipped (exists)"):
+                    counts["completed"] += 1
+                    total_pct += 100
+                elif s in ("Failed", "Cancelled"):
+                    counts["failed"] += 1
         avg = total_pct / total if total > 0 else 0
         self.dl_status_var.set(f"{avg:.0f}% overall  ({checked} checked, {total} items)")
         self.dl_progress["value"] = avg
@@ -1482,13 +1607,33 @@ class TeleTurboGUI:
     # Toast notification
     # ----------------------------------------------------------------
     def _toast(self, message, duration=3000):
+        if not hasattr(self, "_toasts"):
+            self._toasts: list[tk.Frame] = []
+        # Cap visible toasts at 3; dismiss oldest
+        while len(self._toasts) >= 3:
+            old = self._toasts.pop(0)
+            try:
+                old.destroy()
+            except tk.TclError:
+                pass
         toast = tk.Frame(self.root, bg=C["card_bg"],
                          highlightbackground=C["border"],
                          highlightthickness=1)
         tk.Label(toast, text=message, bg=C["card_bg"], fg=C["text_primary"],
                  font=("Segoe UI", 10), padx=16, pady=8).pack()
-        toast.place(relx=1.0, rely=1.0, anchor=tk.SE, x=-20, y=-50)
-        self.root.after(duration, toast.destroy)
+        # Stack from bottom-right, each toast above the previous
+        offset = -50 - (len(self._toasts) * 50)
+        toast.place(relx=1.0, rely=1.0, anchor=tk.SE, x=-20, y=offset)
+        self._toasts.append(toast)
+        self.root.after(duration, self._dismiss_toast, toast)
+
+    def _dismiss_toast(self, toast: tk.Frame):
+        try:
+            toast.destroy()
+        except tk.TclError:
+            pass
+        if hasattr(self, "_toasts") and toast in self._toasts:
+            self._toasts.remove(toast)
 
     def _format_eta(self, secs: float) -> str:
         if secs <= 0:
@@ -1595,27 +1740,22 @@ class TeleTurboGUI:
                 it.status = DownloadStatus.QUEUED
                 items.append(it)
         if items:
-            if not self.download_queue:
-                self.download_queue = DownloadQueue(
-                    self.client,
-                    max_concurrent=int(self.concurrent_var.get().strip() or 3),
-                )
-                self.download_queue.set_on_update(self._on_dl_update)
+            self._ensure_queue()
             self.download_queue.add_items(items)
-            self._log(f"Starting {len(items)} items...")
-            self.btn_start.configure(state=tk.DISABLED)
-            self.btn_pause.configure(state=tk.NORMAL, text="\u23F8 Pause")
-            self.btn_cancel_all.configure(state=tk.NORMAL)
-            self._run_async(self.download_queue.process())
+            self._log(f"Added {len(items)} item(s) to download queue")
+            self._run_async(self.download_queue.start())
 
     def _ctx_pause(self):
+        """Cancel selected in-progress downloads. (.part files kept for resume.)"""
         sel = self.dl_tree.selection()
         if not sel:
             return
+        if not self.download_queue:
+            return
         for cid in sel:
             it = self._find_dl_item(cid)
-            if it and it.status == DownloadStatus.DOWNLOADING:
-                self.download_queue.cancel(it) if self.download_queue else None
+            if it and it.status in (DownloadStatus.DOWNLOADING, DownloadStatus.QUEUED):
+                self.download_queue.cancel(it)
 
     def _ctx_open_folder(self):
         sel = self.dl_tree.selection()
@@ -1627,6 +1767,35 @@ class TeleTurboGUI:
                 import subprocess
                 subprocess.Popen(["explorer", "/select,", str(it.full_path)])
                 break
+
+    def _ctx_retry(self):
+        """Re-queue selected failed/cancelled items and start the queue."""
+        sel = self.dl_tree.selection()
+        if not sel:
+            return
+        items = []
+        for cid in sel:
+            it = self._find_dl_item(cid)
+            if it and it.status in (DownloadStatus.FAILED, DownloadStatus.CANCELLED):
+                # Remove existing .part so we restart fresh
+                part = it.full_path.with_suffix(it.full_path.suffix + ".part")
+                if part.exists():
+                    try:
+                        part.unlink()
+                    except OSError:
+                        pass
+                it.status = DownloadStatus.QUEUED
+                # Reset in-tree status display
+                if self.dl_tree.exists(cid):
+                    vals = list(self.dl_tree.item(cid, "values"))
+                    vals[5] = it.status.value
+                    self.dl_tree.item(cid, values=vals)
+                items.append(it)
+        if items:
+            self._ensure_queue()
+            self.download_queue.add_items(items)
+            self._log(f"Retrying {len(items)} item(s)")
+            self._run_async(self.download_queue.start())
 
     # ----------------------------------------------------------------
     # Keyboard shortcuts
@@ -1648,4 +1817,10 @@ class TeleTurboGUI:
                 vals = list(self.dialog_tree.item(item, "values"))
                 vals[0] = UNCHECKED if vals[0] == CHECKED else CHECKED
                 self.dialog_tree.item(item, values=vals)
+                iid = int(item)
+                for d in self._dialogs_data:
+                    if d["id"] == iid:
+                        d["_checked"] = vals[0] == CHECKED
+                        break
+                self._update_fetch_button()
             return "break"

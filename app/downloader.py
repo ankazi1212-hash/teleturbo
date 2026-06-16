@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from pathlib import Path
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Optional
 
 from .client import TGClient
+
+
+async def _noop():
+    """No-op coroutine used as a safe return value for start() when already running."""
+    return None
 
 
 class DownloadStatus(Enum):
@@ -33,6 +39,7 @@ class DownloadItem:
     speed: float = 0.0
     eta: float = 0.0
     error: Optional[str] = None
+    cancel_token: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     @property
     def full_path(self) -> Path:
@@ -51,14 +58,19 @@ class DownloadQueue:
         self.max_concurrent = max_concurrent
         self._queue: asyncio.Queue[DownloadItem] = asyncio.Queue()
         self._items: list[DownloadItem] = []
-        self._cancelled: set[int] = set()
+        self._cancelled: set[str] = set()
         self._paused = False
         self._on_update: Optional[Callable[[Optional[DownloadItem]], None]] = None
         self._running = False
+        self._started = False
 
     @property
     def items(self) -> list[DownloadItem]:
         return self._items
+
+    @property
+    def is_active(self) -> bool:
+        return self._running and self._started
 
     def set_on_update(self, callback: Callable[[Optional[DownloadItem]], None]):
         self._on_update = callback
@@ -73,6 +85,19 @@ class DownloadQueue:
             self._queue.put_nowait(it)
         self._notify()
 
+    def start(self):
+        """Start workers if not already started. Safe to call multiple times.
+
+        Returns an awaitable that always resolves to None (even if workers
+        were already started), so callers can pass the result to ensure_future
+        or run_coroutine_threadsafe without NoneType errors.
+        """
+        if not self._started:
+            self._started = True
+            self._running = True
+            return asyncio.ensure_future(self.process())
+        return _noop()
+
     def remove_item(self, item: DownloadItem):
         if item in self._items:
             self._items.remove(item)
@@ -81,14 +106,14 @@ class DownloadQueue:
     def cancel(self, item: DownloadItem):
         if item.status in (DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING):
             item.status = DownloadStatus.CANCELLED
-            self._cancelled.add(id(item))
+            self._cancelled.add(item.cancel_token)
             self._notify(item)
 
     def cancel_all(self):
         for item in self._items:
             if item.status in (DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING):
                 item.status = DownloadStatus.CANCELLED
-                self._cancelled.add(id(item))
+                self._cancelled.add(item.cancel_token)
         self._notify()
 
     def toggle_pause(self):
@@ -96,7 +121,6 @@ class DownloadQueue:
         return self._paused
 
     async def process(self):
-        self._running = True
         workers = [asyncio.create_task(self._worker(f"w{i}")) for i in range(self.max_concurrent)]
         try:
             await asyncio.gather(*workers)
@@ -112,7 +136,7 @@ class DownloadQueue:
                 item = await asyncio.wait_for(self._queue.get(), timeout=0.5)
             except asyncio.TimeoutError:
                 continue
-            if id(item) in self._cancelled:
+            if item.cancel_token in self._cancelled:
                 self._queue.task_done()
                 continue
 
@@ -151,7 +175,7 @@ class DownloadQueue:
 
                 def _progress(curr, total):
                     nonlocal last_notify, _speed_last_bytes, _speed_last_time
-                    if id(item) in self._cancelled:
+                    if item.cancel_token in self._cancelled:
                         raise asyncio.CancelledError()
                     now = time.monotonic()
                     elapsed = now - _speed_last_time
@@ -175,12 +199,13 @@ class DownloadQueue:
                     progress_callback=_progress,
                 )
 
-                part_path.rename(final_path)
-                if id(item) not in self._cancelled:
+                if item.cancel_token in self._cancelled:
+                    item.status = DownloadStatus.CANCELLED
+                    self._notify(item)
+                else:
+                    part_path.rename(final_path)
                     item.status = DownloadStatus.COMPLETED
                     item.progress = 100.0
-                else:
-                    item.status = DownloadStatus.CANCELLED
             except asyncio.CancelledError:
                 item.status = DownloadStatus.CANCELLED
             except Exception as e:

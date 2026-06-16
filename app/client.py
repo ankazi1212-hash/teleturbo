@@ -7,9 +7,48 @@ from telethon.errors import (
     PhoneCodeInvalidError,
     AuthRestartError,
 )
-from telethon.tl.types import DocumentAttributeFilename
+from telethon.tl.types import DocumentAttributeFilename, InputMessagesFilterVideo
 
 SESSION_DIR = "sessions"
+
+_VIDEO_MIME_MAP = {
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/x-matroska": ".mkv",
+    "video/webm": ".webm",
+    "video/avi": ".avi",
+    "video/x-msvideo": ".avi",
+    "video/mpeg": ".mpeg",
+    "video/3gpp": ".3gp",
+}
+
+_FILE_MIME_MAP = {
+    "application/pdf": ".pdf",
+    "application/zip": ".zip",
+    "application/x-rar-compressed": ".rar",
+    "application/x-7z-compressed": ".7z",
+    "application/x-tar": ".tar",
+    "application/gzip": ".gz",
+    "text/plain": ".txt",
+    "text/csv": ".csv",
+    "text/html": ".html",
+    "application/json": ".json",
+    "application/xml": ".xml",
+    "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.ms-excel": ".xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.ms-powerpoint": ".ppt",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "audio/mpeg": ".mp3",
+    "audio/ogg": ".ogg",
+    "audio/wav": ".wav",
+    "audio/flac": ".flac",
+}
 
 
 class TGClient:
@@ -72,12 +111,23 @@ class TGClient:
         return result
 
     async def get_video_messages(self, chat_id, limit=200):
-        messages = []
-        async for msg in self.client.iter_messages(chat_id, limit=limit):
-            if self._is_video(msg):
+        """Fetch video messages. Uses server-side filter for speed; falls back
+        to client-side filter for documents with video mime-type."""
+        try:
+            messages = []
+            async for msg in self.client.iter_messages(
+                    chat_id, limit=limit, filter=InputMessagesFilterVideo()):
                 messages.append(msg)
-        messages.reverse()
-        return messages
+            messages.reverse()
+            return messages
+        except Exception:
+            # Fallback: client-side filter (handles video sent as document)
+            messages = []
+            async for msg in self.client.iter_messages(chat_id, limit=limit):
+                if self._is_video(msg):
+                    messages.append(msg)
+            messages.reverse()
+            return messages
 
     async def download_media(self, message, file_path, progress_callback=None):
         return await self.client.download_media(
@@ -97,15 +147,12 @@ class TGClient:
         file_path.parent.mkdir(parents=True, exist_ok=True)
         mode = "ab" if existing_size > 0 else "wb"
         written = existing_size
-        try:
-            with open(file_path, mode) as f:
-                async for chunk in self.client.iter_download(message, offset=existing_size):
-                    f.write(chunk)
-                    written += len(chunk)
-                    if progress_callback and total_size > 0:
-                        progress_callback(written, total_size)
-        except Exception:
-            raise
+        with open(file_path, mode) as f:
+            async for chunk in self.client.iter_download(message, offset=existing_size):
+                f.write(chunk)
+                written += len(chunk)
+                if progress_callback and total_size > 0:
+                    progress_callback(written, total_size)
         return file_path
 
     async def get_message_from_link(self, link: str):
@@ -139,6 +186,25 @@ class TGClient:
             return msg.document.mime_type.startswith("video/")
         return False
 
+    @staticmethod
+    def _is_file(msg) -> bool:
+        """True for any document that is NOT a video (to avoid overlap with _is_video)."""
+        if not msg.document:
+            return False
+        if msg.video:
+            return False
+        if msg.document.mime_type and msg.document.mime_type.startswith("video/"):
+            return False
+        return True
+
+    async def get_file_messages(self, chat_id, limit=200):
+        messages = []
+        async for msg in self.client.iter_messages(chat_id, limit=limit):
+            if self._is_file(msg):
+                messages.append(msg)
+        messages.reverse()
+        return messages
+
     async def download_thumbnail(self, message, save_path):
         try:
             return await self.client.download_media(message, file=save_path, thumb=-1)
@@ -157,27 +223,29 @@ class TGClient:
         return 0
 
     @staticmethod
-    def get_video_filename(msg) -> str:
+    def _get_filename(msg, prefix: str, mime_map: dict, default_ext: str) -> str:
+        """Extract a filename from a Telegram message, falling back to a generated name."""
         if msg.file and msg.file.name:
             return msg.file.name
         if msg.document:
             for attr in msg.document.attributes:
                 if isinstance(attr, DocumentAttributeFilename) and attr.file_name:
                     return attr.file_name
-        ext = ".mp4"
-        mime_map = {
-            "video/mp4": ".mp4",
-            "video/quicktime": ".mov",
-            "video/x-matroska": ".mkv",
-            "video/webm": ".webm",
-            "video/avi": ".avi",
-            "video/x-msvideo": ".avi",
-            "video/mpeg": ".mpeg",
-            "video/3gpp": ".3gp",
-        }
+        ext = default_ext
+        mime = None
         if msg.video and msg.video.mime_type:
-            ext = mime_map.get(msg.video.mime_type, ".mp4")
+            mime = msg.video.mime_type
         elif msg.document and msg.document.mime_type:
-            ext = mime_map.get(msg.document.mime_type, ".mp4")
+            mime = msg.document.mime_type
+        if mime:
+            ext = mime_map.get(mime, default_ext)
         date_str = msg.date.strftime("%Y%m%d_%H%M%S") if msg.date else "unknown"
-        return f"video_{msg.id}_{date_str}{ext}"
+        return f"{prefix}_{msg.id}_{date_str}{ext}"
+
+    @staticmethod
+    def get_video_filename(msg) -> str:
+        return TGClient._get_filename(msg, "video", _VIDEO_MIME_MAP, ".mp4")
+
+    @staticmethod
+    def get_file_filename(msg) -> str:
+        return TGClient._get_filename(msg, "file", _FILE_MIME_MAP, ".bin")
